@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
@@ -803,7 +803,7 @@ fn send_client_detach(stream: &mut UnixStream) {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct FrameWire {
     cells: Vec<CellWire>,
     width: u16,
@@ -813,8 +813,23 @@ struct FrameWire {
     graphics: Vec<u8>,
 }
 
+/// Mirror of `protocol::FrameDelta` (`src/protocol/wire.rs`): the changed cells the server streams
+/// instead of a full frame once the diff is small enough (`src/server/render_stream.rs`
+/// `prepare_frame`). Field order and `base_checksum` placement must match the protocol struct.
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct FrameDeltaWire {
+    width: u16,
+    height: u16,
+    cells: Vec<(u32, CellWire)>,
+    cursor: Option<CursorWire>,
+    hyperlinks: Vec<String>,
+    graphics: Vec<u8>,
+    base_checksum: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct CellWire {
     symbol: String,
     fg: u32,
@@ -824,7 +839,7 @@ struct CellWire {
     hyperlink: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 struct CursorWire {
     x: u16,
     y: u16,
@@ -848,6 +863,52 @@ fn decode_frame_payload(payload: &[u8]) -> io::Result<FrameWire> {
             }
             Ok(frame)
         })
+}
+
+fn decode_frame_delta_payload(payload: &[u8]) -> io::Result<FrameDeltaWire> {
+    // `base_checksum` is appended last precisely so decoders tolerate trailing bytes from a newer
+    // producer (`src/protocol/wire.rs`), so this deliberately does not assert full consumption.
+    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+        .map(|(delta, _consumed): (FrameDeltaWire, usize)| delta)
+}
+
+/// Reconstruct the full frame `delta` describes on top of `baseline`, mirroring
+/// `FrameData::with_delta` (`src/protocol/wire.rs`): `None` on a dimension or index mismatch, so
+/// the caller re-baselines instead of rendering a half-applied frame.
+fn apply_frame_delta(baseline: &FrameWire, delta: &FrameDeltaWire) -> Option<FrameWire> {
+    let expected = (delta.width as usize) * (delta.height as usize);
+    if baseline.width != delta.width
+        || baseline.height != delta.height
+        || baseline.cells.len() != expected
+    {
+        return None;
+    }
+    let mut cells = baseline.cells.clone();
+    for (index, cell) in &delta.cells {
+        let index = *index as usize;
+        if index >= cells.len() {
+            return None;
+        }
+        cells[index] = cell.clone();
+    }
+    Some(FrameWire {
+        cells,
+        width: delta.width,
+        height: delta.height,
+        cursor: delta.cursor.clone(),
+        hyperlinks: delta.hyperlinks.clone(),
+        graphics: delta.graphics.clone(),
+    })
+}
+
+/// `ClientMessage::RequestFullFrame` (variant 11, protocol v14): asks the server to reset this
+/// client's render baseline so its next render is a full frame. Sent when a delta cannot be
+/// applied — the same recovery the real client performs.
+fn send_request_full_frame(stream: &mut UnixStream) {
+    let payload = encode_varint_u32(11);
+    let _ = stream.write_all(&frame_message(&payload));
+    let _ = stream.flush();
 }
 
 fn read_server_message_payload(
@@ -902,8 +963,121 @@ fn wait_for_frame(stream: &mut UnixStream, timeout: Duration) -> bool {
     false
 }
 
+/// Per-client frame reconstruction, mirroring the real client (`src/client/mod.rs`, the
+/// `ServerMessage::FrameDelta` arm): a full `Frame` (tag 1) sets the baseline and each `FrameDelta`
+/// (tag 9) is applied onto it. Test helpers that wait for on-screen content must own one of these
+/// across drains and waits, because the server only re-sends a full frame when the diff is large
+/// (`src/server/render_stream.rs` `prepare_frame`) — everything else is delta-only.
+struct FrameObserver {
+    baseline: Option<FrameWire>,
+    deltas_applied: usize,
+    deltas_dropped: usize,
+}
+
+impl FrameObserver {
+    fn new() -> Self {
+        Self {
+            baseline: None,
+            deltas_applied: 0,
+            deltas_dropped: 0,
+        }
+    }
+
+    /// Feed one decoded (inflated) server message. Returns `true` when [`Self::frame`] now holds a
+    /// newly reconstructed full frame.
+    fn observe(
+        &mut self,
+        stream: &mut UnixStream,
+        variant: u32,
+        payload: &[u8],
+    ) -> io::Result<bool> {
+        match variant {
+            1 => {
+                self.baseline = Some(decode_frame_payload(payload)?);
+                Ok(true)
+            }
+            9 => {
+                let delta = decode_frame_delta_payload(payload)?;
+                // The delta's `base_checksum` pins the exact baseline the server built it against;
+                // applying it onto anything else would reconstruct wrong cells, so drop it and ask
+                // for a full re-baseline (protocol v14) exactly like the real client does.
+                let reconstructed = self.baseline.as_ref().and_then(|baseline| {
+                    (frame_wire_checksum(baseline) == delta.base_checksum)
+                        .then(|| apply_frame_delta(baseline, &delta))
+                        .flatten()
+                });
+                match reconstructed {
+                    Some(frame) => {
+                        self.baseline = Some(frame);
+                        self.deltas_applied += 1;
+                        Ok(true)
+                    }
+                    None => {
+                        self.baseline = None;
+                        self.deltas_dropped += 1;
+                        send_request_full_frame(stream);
+                        Ok(false)
+                    }
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn frame(&self) -> Option<&FrameWire> {
+        self.baseline.as_ref()
+    }
+
+    fn diagnostics(&self) -> String {
+        format!(
+            "observer: deltas applied={}, dropped={}, baseline={}",
+            self.deltas_applied,
+            self.deltas_dropped,
+            if self.baseline.is_some() {
+                "present"
+            } else {
+                "missing"
+            }
+        )
+    }
+}
+
+/// Content checksum of a reconstructed frame, mirroring `protocol::frame_checksum`
+/// (`src/protocol/wire.rs`): FNV-1a over width, height and every cell, cursor/graphics excluded.
+/// A `FrameDelta` carries the checksum of the baseline it was built against; applying it onto a
+/// baseline that hashes differently would silently reconstruct wrong cells.
+fn frame_wire_checksum(frame: &FrameWire) -> u64 {
+    fn fold(hash: &mut u64, bytes: &[u8]) {
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        for byte in bytes {
+            *hash ^= *byte as u64;
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    fold(&mut hash, &frame.width.to_le_bytes());
+    fold(&mut hash, &frame.height.to_le_bytes());
+    for cell in &frame.cells {
+        fold(&mut hash, cell.symbol.as_bytes());
+        fold(&mut hash, &[0]);
+        fold(&mut hash, &cell.fg.to_le_bytes());
+        fold(&mut hash, &cell.bg.to_le_bytes());
+        fold(&mut hash, &cell.modifier.to_le_bytes());
+        fold(&mut hash, &[cell.skip as u8]);
+        match cell.hyperlink {
+            Some(index) => {
+                fold(&mut hash, &[1]);
+                fold(&mut hash, &index.to_le_bytes());
+            }
+            None => fold(&mut hash, &[0]),
+        }
+    }
+    hash
+}
+
 fn wait_for_frame_matching_with_snapshots(
     stream: &mut UnixStream,
+    observer: &mut FrameObserver,
     timeout: Duration,
     predicate: impl Fn(&FrameWire) -> bool,
 ) -> io::Result<(bool, Vec<String>)> {
@@ -917,13 +1091,15 @@ fn wait_for_frame_matching_with_snapshots(
             Ok((variant, payload)) => {
                 // issue #13: inflate deflate-wrapped frames before decoding.
                 let (variant, payload) = support::inflate_compressed_frame(variant, &payload);
-                if variant == 1 {
-                    let frame = decode_frame_payload(&payload)?;
+                if observer.observe(stream, variant, &payload)? {
+                    let frame = observer
+                        .frame()
+                        .expect("a reconstructed frame follows an accepted message");
                     if snapshots.len() == 5 {
                         snapshots.pop_front();
                     }
-                    snapshots.push_back(frame_text(&frame));
-                    if predicate(&frame) {
+                    snapshots.push_back(frame_text(frame));
+                    if predicate(frame) {
                         return Ok((true, snapshots.into_iter().collect()));
                     }
                 }
@@ -934,6 +1110,41 @@ fn wait_for_frame_matching_with_snapshots(
     }
 
     Ok((false, snapshots.into_iter().collect()))
+}
+
+/// Like [`wait_for_frame`], but records the full frame it consumed into `observer` so a later
+/// predicate wait can apply deltas onto that baseline instead of discarding it.
+fn wait_for_frame_observed(
+    stream: &mut UnixStream,
+    observer: &mut FrameObserver,
+    timeout: Duration,
+) -> bool {
+    matches!(
+        wait_for_frame_matching_with_snapshots(stream, observer, timeout, |_| true),
+        Ok((true, _))
+    )
+}
+
+/// Like [`drain_server_messages`], but keeps the client's frame baseline: the initial frames a test
+/// drains are exactly the full frames every later delta is built against.
+fn drain_server_messages_observing(
+    stream: &mut UnixStream,
+    max_drain: Duration,
+    observer: &mut FrameObserver,
+) {
+    let deadline = Instant::now() + max_drain;
+    while Instant::now() < deadline {
+        match read_server_message_payload(stream, Duration::from_millis(50)) {
+            Ok((variant, payload)) => {
+                let (variant, payload) = support::inflate_compressed_frame(variant, &payload);
+                if observer.observe(stream, variant, &payload).is_err() {
+                    break;
+                }
+            }
+            Err(err) if is_timeout(&err) => break,
+            Err(_) => break,
+        }
+    }
 }
 
 fn frame_text(frame: &FrameWire) -> String {
@@ -1078,13 +1289,23 @@ fn non_foreground_client_render_preserves_agent_panel_scroll() {
     }
 
     let mut setup_client = connect_raw_client(&client_socket, 106, 40);
-    assert!(wait_for_frame(&mut setup_client, Duration::from_secs(2)));
-    drain_server_messages(&mut setup_client, Duration::from_millis(250));
+    let mut setup_observer = FrameObserver::new();
+    assert!(wait_for_frame_observed(
+        &mut setup_client,
+        &mut setup_observer,
+        Duration::from_secs(2)
+    ));
+    drain_server_messages_observing(
+        &mut setup_client,
+        Duration::from_millis(250),
+        &mut setup_observer,
+    );
 
     let wheel_down = b"\x1b[<65;10;30M";
     send_client_input(&mut setup_client, &wheel_down.repeat(20));
     let (reached_bottom, setup_frames) = wait_for_frame_matching_with_snapshots(
         &mut setup_client,
+        &mut setup_observer,
         Duration::from_secs(3),
         |frame| agent_panel_starts_with(frame, "agent-19"),
     )
@@ -1100,24 +1321,29 @@ fn non_foreground_client_render_preserves_agent_panel_scroll() {
     let mut tall_background = connect_raw_client(&client_socket, 106, 64);
     assert!(wait_for_frame(&mut tall_background, Duration::from_secs(2)));
     let mut probe = connect_raw_client(&client_socket, 106, 40);
-    let (started_at_tall_limit, initial_frames) =
-        wait_for_frame_matching_with_snapshots(&mut probe, Duration::from_secs(3), |frame| {
-            agent_panel_starts_with(frame, "agent-15")
-        })
-        .expect("initial probe frame decoding should succeed");
+    let mut probe_observer = FrameObserver::new();
+    let (started_at_tall_limit, initial_frames) = wait_for_frame_matching_with_snapshots(
+        &mut probe,
+        &mut probe_observer,
+        Duration::from_secs(3),
+        |frame| agent_panel_starts_with(frame, "agent-15"),
+    )
+    .expect("initial probe frame decoding should succeed");
     assert!(
         started_at_tall_limit,
         "tall client should normalize the shared scroll before the probe attaches; frames:\n{}",
         initial_frames.join("\n--- frame ---\n")
     );
-    drain_server_messages(&mut probe, Duration::from_millis(250));
+    drain_server_messages_observing(&mut probe, Duration::from_millis(250), &mut probe_observer);
 
     send_client_input(&mut probe, wheel_down);
-    let (scrolled, probe_frames) =
-        wait_for_frame_matching_with_snapshots(&mut probe, Duration::from_secs(3), |frame| {
-            agent_panel_starts_with(frame, "agent-16")
-        })
-        .expect("probe frame decoding should succeed");
+    let (scrolled, probe_frames) = wait_for_frame_matching_with_snapshots(
+        &mut probe,
+        &mut probe_observer,
+        Duration::from_secs(3),
+        |frame| agent_panel_starts_with(frame, "agent-16"),
+    )
+    .expect("probe frame decoding should succeed");
     assert!(
         scrolled,
         "background client projection must not undo the foreground wheel event; frames:\n{}",
@@ -1147,9 +1373,15 @@ fn multi_client_broadcasts_frame_updates_to_all_clients() {
     let (_workspace_id, pane_id) =
         create_workspace_and_root_pane(&api_socket, "broadcast-client-a-to-b");
 
-    // Drain initial frames so we measure the frame caused by new input.
+    // Drain initial frames so we measure the frame caused by new input. Client B keeps the full
+    // frame it drained as its baseline: the marker update is streamed as a delta against it.
     drain_server_messages(&mut client_a, Duration::from_millis(300));
-    drain_server_messages(&mut client_b, Duration::from_millis(300));
+    let mut client_b_observer = FrameObserver::new();
+    drain_server_messages_observing(
+        &mut client_b,
+        Duration::from_millis(300),
+        &mut client_b_observer,
+    );
 
     let marker = format!(
         "MB{}",
@@ -1167,21 +1399,170 @@ fn multi_client_broadcasts_frame_updates_to_all_clients() {
             log_tail(&server_log_path(&config_home), 80)
         );
     }
-    let (received, client_b_frames) =
-        wait_for_frame_matching_with_snapshots(&mut client_b, Duration::from_secs(10), |frame| {
-            frame_contains_text(frame, &marker)
-        })
-        .expect("frame decoding should succeed");
+    let (received, client_b_frames) = wait_for_frame_matching_with_snapshots(
+        &mut client_b,
+        &mut client_b_observer,
+        Duration::from_secs(10),
+        |frame| frame_contains_text(frame, &marker),
+    )
+    .expect("frame decoding should succeed");
 
     assert!(
         received,
-        "client B should receive a broadcast frame containing client A marker. pane output:\n{}\nclient B frame snapshots:\n{}\nserver log tail:\n{}",
+        "client B should receive a broadcast frame containing client A marker. pane output:\n{}\n{}\nclient B frame snapshots:\n{}\nserver log tail:\n{}",
         pane_read_recent(&api_socket, &pane_id, 200),
+        client_b_observer.diagnostics(),
         client_b_frames.join("\n--- frame ---\n"),
         log_tail(&server_log_path(&config_home), 80)
     );
 
     cleanup_spawned_herdr(server, base);
+}
+
+/// Build a full frame of `width`x`height` whose rows are `rows` (padded/truncated with spaces).
+fn text_frame_wire(width: u16, height: u16, rows: &[&str]) -> FrameWire {
+    let mut cells = Vec::with_capacity((width as usize) * (height as usize));
+    for row in 0..height as usize {
+        let text: Vec<char> = rows.get(row).copied().unwrap_or("").chars().collect();
+        for col in 0..width as usize {
+            cells.push(CellWire {
+                symbol: text.get(col).copied().unwrap_or(' ').to_string(),
+                fg: 0,
+                bg: 0,
+                modifier: 0,
+                skip: false,
+                hyperlink: None,
+            });
+        }
+    }
+    FrameWire {
+        cells,
+        width,
+        height,
+        cursor: None,
+        hyperlinks: Vec::new(),
+        graphics: Vec::new(),
+    }
+}
+
+/// Encode a `ServerMessage` as it appears on the wire: `[u32LE len][varint tag][bincode body]`.
+fn encode_server_message<T: Serialize>(tag: u32, body: &T) -> Vec<u8> {
+    frame_message(&encode_server_message_payload(tag, body))
+}
+
+/// The unframed `[varint tag][bincode body]` payload of a `ServerMessage`.
+fn encode_server_message_payload<T: Serialize>(tag: u32, body: &T) -> Vec<u8> {
+    let mut payload = encode_varint_u32(tag);
+    payload.extend_from_slice(
+        &bincode::serde::encode_to_vec(body, bincode::config::standard())
+            .expect("server message body should encode"),
+    );
+    payload
+}
+
+/// Wrap a message in `ServerMessage::Compressed` (tag 11) exactly as
+/// `protocol::compress_server_message` does: deflate the whole inner `[varint tag][body]` payload
+/// and carry it as a bincode `Vec<u8>` — the format `support::inflate_compressed_frame` expects.
+fn encode_compressed_server_message<T: Serialize>(tag: u32, body: &T) -> Vec<u8> {
+    let inner = encode_server_message_payload(tag, body);
+    let deflated = miniz_oxide::deflate::compress_to_vec(&inner, 1);
+    encode_server_message(11, &deflated)
+}
+
+/// Deterministic regression for the test observer itself (issue #72 gate prerequisite): the server
+/// streams a full `Frame` (tag 1) once and then `FrameDelta`s (tag 9, deflate-wrapped in tag 11
+/// once over `FRAME_COMPRESSION_THRESHOLD`) while at most 75% of the cells change
+/// (`src/server/render_stream.rs` `prepare_frame`). A frame-waiting helper that only decodes tag 1
+/// never sees delta-only content and reports "no such frame" for state the server really did send.
+///
+/// The assertions are deliberately whole-frame, not "the marker appeared somewhere": a helper that
+/// fabricated a blank baseline and pasted the delta onto it would also contain the marker, so this
+/// pins the reconstruction to be byte-identical to the frame the server rendered — the unchanged
+/// header row retained from the baseline, plus the cursor/hyperlinks/graphics the delta carries —
+/// and pins that it took the delta path exactly once with no dropped-baseline recovery.
+#[test]
+fn frame_observer_reconstructs_delta_only_marker_from_full_baseline() {
+    let (mut server_side, mut client_side) =
+        UnixStream::pair().expect("unix socket pair should be created");
+
+    let marker = "DELTAMARK";
+    let baseline = text_frame_wire(16, 3, &["header", "", ""]);
+    let mut updated = text_frame_wire(16, 3, &["header", marker, ""]);
+    // Fields a delta carries wholesale rather than diffing, so the equality check below proves the
+    // observer takes them from the delta instead of keeping the baseline's.
+    updated.cursor = Some(CursorWire {
+        x: 9,
+        y: 1,
+        visible: true,
+        shape: 2,
+    });
+    updated.hyperlinks = vec!["https://example.invalid/delta".to_string()];
+    updated.graphics = vec![0x1b, b'_', b'G', 0x1b, b'\\'];
+
+    let changed: Vec<(u32, CellWire)> = updated
+        .cells
+        .iter()
+        .zip(baseline.cells.iter())
+        .enumerate()
+        .filter(|(_, (new, old))| new != old)
+        .map(|(index, (new, _))| (index as u32, new.clone()))
+        .collect();
+    assert!(
+        !changed.is_empty() && changed.len() * 4 <= updated.cells.len() * 3,
+        "fixture must be a delta the server would actually stream: changed={} of {}",
+        changed.len(),
+        updated.cells.len()
+    );
+    let delta = FrameDeltaWire {
+        width: updated.width,
+        height: updated.height,
+        cells: changed,
+        cursor: updated.cursor.clone(),
+        hyperlinks: updated.hyperlinks.clone(),
+        graphics: updated.graphics.clone(),
+        base_checksum: frame_wire_checksum(&baseline),
+    };
+
+    server_side
+        .write_all(&encode_server_message(1, &baseline))
+        .expect("write baseline frame");
+    // The delta travels compressed, the way the render path actually ships it.
+    server_side
+        .write_all(&encode_compressed_server_message(9, &delta))
+        .expect("write compressed frame delta");
+    server_side.flush().expect("flush server messages");
+
+    let mut observer = FrameObserver::new();
+    let (received, snapshots) = wait_for_frame_matching_with_snapshots(
+        &mut client_side,
+        &mut observer,
+        Duration::from_secs(2),
+        |frame| frame_contains_text(frame, marker),
+    )
+    .expect("frame decoding should succeed");
+
+    assert!(
+        received,
+        "observer must apply the compressed delta onto its full baseline; {}\nsnapshots:\n{}",
+        observer.diagnostics(),
+        snapshots.join("\n--- frame ---\n")
+    );
+    assert_eq!(
+        observer.frame(),
+        Some(&updated),
+        "reconstruction must equal the frame the server rendered, not a delta pasted onto a \
+         fabricated baseline; {}",
+        observer.diagnostics()
+    );
+    assert_eq!(
+        (observer.deltas_applied, observer.deltas_dropped),
+        (1, 0),
+        "the delta must be applied once with no baseline-desync recovery; {}",
+        observer.diagnostics()
+    );
+
+    // Keep the sender alive until the assertions so a miss times out honestly instead of EOF-ing.
+    drop(server_side);
 }
 
 #[test]
