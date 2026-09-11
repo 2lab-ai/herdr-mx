@@ -13,6 +13,7 @@
 - Fixed `herdr status` hanging indefinitely when the session it points at is alive but not answering: the server probe is now bounded and such a server is reported as `unreachable` (`"unreachable"` in `--json`) instead of blocking the command.
 - Fixed remote provisioning talking to the wrong server on a host running more than one session: the readiness check, live handoff and stop commands never passed `--session`, so for a remote attached to a named session the compatibility decision was made against the default session's server and a restart landed on unrelated panes. This also affected `herdr --remote <host> --session <name>` from the CLI.
 - Fixed a failed remote management request (enable/disable, remove, auto-update, session switch) being discarded silently instead of reporting on the host banner.
+- Fixed remote bridge connections outliving the bridge that owns them. A connection accepted just as a remote was detached or reconnected could start its `ssh` after teardown had already finished, leaving that process running with nothing left to stop it, and a connection whose `ssh` had ended kept its worker thread and the local socket parked on a client that never disconnects. Every in-flight connection now watches its bridge for teardown, ends and reaps the `ssh` process it owns, and releases the local socket in both directions, while a normal request still drains its full response first.
 
 ## [0.8.2] - 2026-08-19
 

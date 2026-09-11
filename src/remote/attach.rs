@@ -19,6 +19,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
+// #72: how often an in-flight bridge connection re-checks its ssh child and its owning bridge's
+// stop flag. Same cadence as the accept poll, and nothing user-visible waits on it: the copy
+// threads move the bytes, this only decides when the worker may finish.
+const BRIDGE_CHILD_POLL: Duration = Duration::from_millis(50);
+// #72: how long a cancelled ssh gets to exit on SIGTERM before it is killed outright. Without a
+// bound, an ssh that ignores the signal would pin its worker for the life of the process.
+const BRIDGE_CHILD_KILL_GRACE: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const BRIDGE_IO_POLL: Duration = Duration::from_millis(1);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -309,8 +316,14 @@ impl SshTarget {
         // #72: keepalive. Without it a hung TCP (sleep/wake, network switch, dropped VPN) left the
         // bridge ssh — and its sshd session on the remote — alive for hours while reconnects
         // stacked fresh connections on top, until the remote's sshd stopped accepting new ones.
-        // Dead links now self-terminate within ~60s on both ends. Skip when the user pinned either
-        // knob in their own options.
+        // 15s x 4 bounds the CLIENT end only: this ssh disconnects roughly 60s after the last
+        // reply it received (ssh_config.5, ServerAliveCountMax — "ssh will disconnect from the
+        // server"). It says nothing about the far end. sshd reaps its side of a blackholed link on
+        // its own policy — ClientAliveInterval/ClientAliveCountMax are independent sshd options,
+        // and ClientAliveInterval defaults to 0 (disabled), leaving TCPKeepAlive's hour-scale
+        // timeout — none of which herdr sets or may assume. What the client bound does fix is the
+        // stacking: letting go within a minute stops herdr piling new sessions onto dead ones.
+        // Skip when the user pinned either knob in their own options.
         if !options_pin_keyword(&self.options, "serveraliveinterval") {
             command.arg("-o").arg("ServerAliveInterval=15");
         }
@@ -2246,10 +2259,85 @@ struct SshStdioBridge {
     socket_identity: crate::ipc::SocketFileIdentity,
     should_stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    // #72: pids of in-flight bridge ssh children. SIGTERMed on Drop so a teardown/reconnect never
-    // strands ssh processes (each stranded one held a live sshd session on the remote until its
-    // TCP finally died).
-    children: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
+}
+
+/// #72: run an in-flight bridge connection to its end, leaving nothing this worker owns behind.
+/// It speaks only for what it owns: a shared ssh control master is a separate detached process
+/// and is deliberately untouched here.
+///
+/// Invariants:
+///
+///  * ownership — the worker owns the `Child` end to end and is its only waiter, so a signal
+///    always reaches its own child, never a recycled pid. Waits are polls because the owning
+///    bridge can stop at any point and a blocked thread cannot be reached.
+///  * cancelling = signal the child AND shut the socket down both ways; ending the child alone
+///    leaves the copies blocked on a client that never disconnects.
+///  * half-close — after the reap only the read side is shut down, so the upload copy ends while
+///    what the download thread already wrote stays readable and the response still drains.
+///
+/// `Ok(None)` means this worker stopped the connection itself, so the exit status reports only
+/// that signal and is not a connection failure.
+fn finish_bridge_connection(
+    child: &mut std::process::Child,
+    upload: JoinHandle<()>,
+    download: JoinHandle<()>,
+    local_stream: &UnixStream,
+    bridge_stop: &AtomicBool,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    let mut signalled_at = None;
+    let mut killed = false;
+    let waited = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            // The child is still ours here, so a failed wait leaves through the cleanup below
+            // instead of past it.
+            Err(err) => break Err(err),
+            Ok(None) => {}
+        }
+        match signalled_at {
+            None if bridge_stop.load(Ordering::Acquire) => {
+                crate::platform::signal_processes(
+                    &[child.id()],
+                    crate::platform::Signal::Terminate,
+                );
+                let _ = local_stream.shutdown(std::net::Shutdown::Both);
+                signalled_at = Some(Instant::now());
+            }
+            // An ssh that does not honour SIGTERM would pin this worker for the life of the
+            // process, so the wait is bounded.
+            Some(at) if !killed && at.elapsed() >= BRIDGE_CHILD_KILL_GRACE => {
+                let _ = child.kill();
+                killed = true;
+            }
+            _ => {}
+        }
+        thread::sleep(BRIDGE_CHILD_POLL);
+    };
+
+    let status = match waited {
+        Ok(status) => status,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = local_stream.shutdown(std::net::Shutdown::Both);
+            let _ = upload.join();
+            let _ = download.join();
+            return Err(err);
+        }
+    };
+
+    let _ = local_stream.shutdown(std::net::Shutdown::Read);
+    let mut cancelled = signalled_at.is_some();
+    while !upload.is_finished() || !download.is_finished() {
+        if !cancelled && bridge_stop.load(Ordering::Acquire) {
+            let _ = local_stream.shutdown(std::net::Shutdown::Both);
+            cancelled = true;
+        }
+        thread::sleep(BRIDGE_CHILD_POLL);
+    }
+    let _ = upload.join();
+    let _ = download.join();
+    Ok(signalled_at.is_none().then_some(status))
 }
 
 fn spawn_bridge_worker(
@@ -2296,8 +2384,6 @@ impl SshStdioBridge {
 
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
-        let children = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-        let thread_children = Arc::clone(&children);
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
@@ -2309,7 +2395,10 @@ impl SshStdioBridge {
                         let worker_target = target.clone();
                         let worker_remote_herdr = remote_herdr.clone();
                         let worker_session_name = session_name.clone();
-                        let worker_children = Arc::clone(&thread_children);
+                        // #72: the worker is detached, so it also gets the bridge's stop flag —
+                        // it may not run its first instruction until after the bridge is gone,
+                        // and it is the only owner of the ssh child it is about to start.
+                        let worker_stop = Arc::clone(&thread_stop);
                         spawn_bridge_worker(stream, move |stream| {
                             bridge_connection(
                                 stream,
@@ -2317,7 +2406,7 @@ impl SshStdioBridge {
                                 &worker_remote_herdr,
                                 &worker_session_name,
                                 kind,
-                                &worker_children,
+                                &worker_stop,
                             )
                         });
                     }
@@ -2337,7 +2426,6 @@ impl SshStdioBridge {
             socket_identity,
             should_stop,
             thread: Some(thread),
-            children,
         })
     }
 }
@@ -2354,17 +2442,12 @@ fn prepare_remote_bridge_stream(
 
 impl Drop for SshStdioBridge {
     fn drop(&mut self) {
+        // #72: this flag is the whole teardown signal, and every in-flight connection watches it
+        // (`finish_bridge_connection`): each worker ends and reaps the ssh child it owns, and a
+        // worker that was accepted before this drop but only runs after it declines to dial at
+        // all. A sweep from here could only act on connections that had already registered
+        // themselves, which is precisely the set that was never the problem.
         self.should_stop.store(true, Ordering::Release);
-        // #72: terminate in-flight bridge ssh children. Their workers then unblock out of
-        // `child.wait()` and deregister; the remote sshd session closes with the TCP connection
-        // instead of lingering until a network-level timeout.
-        if let Ok(children) = self.children.lock() {
-            for pid in children.iter() {
-                unsafe {
-                    libc::kill(*pid as libc::pid_t, libc::SIGTERM);
-                }
-            }
-        }
         // upstream v0.8.2 hardening, adopted: only unlink the socket if it is still the file we
         // bound (a blind `remove_file` races a successor bridge onto the same path).
         let _ = crate::ipc::remove_socket_file_if_owned(&self.local_socket, &self.socket_identity);
@@ -2380,8 +2463,15 @@ fn bridge_connection(
     remote_herdr: &RemoteHerdr,
     session_name: &str,
     kind: RemoteBridgeKind,
-    children: &std::sync::Mutex<std::collections::HashSet<u32>>,
+    bridge_stop: &AtomicBool,
 ) -> io::Result<()> {
+    // #72: a worker is spawned detached, so this can be the first instruction it runs AFTER its
+    // bridge was dropped — dialing then starts an ssh child with no owner left to end it.
+    // Teardown is not a connection failure, so it reports success instead of logging per drop.
+    if bridge_stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
     let mut command = target.command(&remote_bridge_command(remote_herdr, session_name, kind));
     command
         .stdin(Stdio::piped())
@@ -2395,22 +2485,39 @@ fn bridge_connection(
     let mut child = command
         .spawn()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
-    // #72: register for the owning bridge's Drop-time SIGTERM sweep; deregistered after wait().
-    if let Ok(mut children) = children.lock() {
-        children.insert(child.id());
-    }
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdin missing"))?;
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
-    let mut stream_to_child = stream.try_clone()?;
-    let mut child_to_stream = stream;
 
+    // #72: from here on every exit path has to leave no ssh behind, so the pipe/socket setup is
+    // resolved in one fallible step whose failure ends and reaps the child. A bare `?` used to
+    // drop the handle, which neither kills nor waits: the ssh kept running with no owner.
+    let prepared = (|| {
+        let child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdin missing"))?;
+        let child_stdout = child.stdout.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing")
+        })?;
+        io::Result::Ok((
+            child_stdin,
+            child_stdout,
+            stream.try_clone()?,
+            stream.try_clone()?,
+        ))
+    })();
+    let (mut child_stdin, mut child_stdout, mut stream_to_child, worker_stream) = match prepared {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
+
+    let mut child_to_stream = stream;
     let upload = thread::spawn(move || {
+        // Ends on the client's half-close; dropping `child_stdin` then hands that EOF to ssh, so
+        // a request/response exchange still gets its answer. Nothing here closes the local
+        // stream — that would cut the response short.
         let _ = copy_flush(&mut stream_to_child, &mut child_stdin);
     });
     let download = thread::spawn(move || {
@@ -2418,21 +2525,14 @@ fn bridge_connection(
         let _ = child_to_stream.shutdown(std::net::Shutdown::Write);
     });
 
-    let status = child.wait();
-    if let Ok(mut children) = children.lock() {
-        children.remove(&child.id());
-    }
-    let status = status?;
-    let _ = upload.join();
-    let _ = download.join();
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
+    match finish_bridge_connection(&mut child, upload, download, &worker_stream, bridge_stop)? {
+        // We stopped it: the status reports our own signal, not a broken connection.
+        None => Ok(()),
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             format!("ssh bridge exited with {status}"),
-        ))
+        )),
     }
 }
 
@@ -3214,21 +3314,109 @@ mod tests {
         assert!(finished_rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 
-    /// #72: dropping the bridge SIGTERMs in-flight bridge ssh children — a teardown/reconnect
-    /// must not strand ssh processes (each held a live sshd session remotely). The `ssh` binary
-    /// is shimmed via PATH (nextest runs one process per test, so the env mutation is isolated).
+    /// #72 scaffolding: a PATH-shimmed `ssh` that records its own pid and then runs `body`. The
+    /// long-running bodies use `exec`, so the recorded pid is the process a signal has to reach —
+    /// a shell parent dies on SIGTERM and orphans its `sleep` for the full 30s. Restores `PATH`
+    /// and SIGKILLs everything it spawned on drop, so a failing assertion cannot leak either.
+    ///
+    /// Mutating `PATH` is process-scoped here for the same reason the existing bridge tests in
+    /// this module already rely on: nextest runs each test in its own process.
+    struct FakeSsh {
+        dir: PathBuf,
+        old_path: std::ffi::OsString,
+    }
+
+    /// Where a shim body publishes its pid; anything the body does before it is in place before
+    /// the bridge can learn the pid and signal it.
+    const PUBLISH_PID: &str = "@pid@";
+    /// A shim that never exits on its own: the connection stays in flight until something ends it.
+    const FAKE_SSH_SLEEP: &str = "@pid@\nexec sleep 30";
+    /// A shim that answers one request: it reads stdin to EOF — i.e. waits for the client's
+    /// half-close — and only then writes its reply, the way the remote `herdr api` end behaves.
+    /// The reply spans several copy buffers so the drain has to survive as a stream, not as one
+    /// lucky write.
+    const FAKE_SSH_REQUEST_RESPONSE: &str =
+        "@pid@\nrequest=$(cat)\nprintf 'pong:%s' \"$request\"\ni=0\nwhile [ $i -lt 64 ]; do printf '%01024d' 0; i=$((i+1)); done";
+    /// Bytes of padding [`FAKE_SSH_REQUEST_RESPONSE`] appends after `pong:<request>`.
+    const FAKE_SSH_RESPONSE_PADDING: usize = 64 * 1024;
+    /// A shim that ends on its own without reading or writing anything, standing in for an ssh
+    /// that dies mid-session (dropped link, remote server restart) while the client stays put.
+    const FAKE_SSH_IMMEDIATE_EXIT: &str = "@pid@\nexec true";
+    /// A shim that writes without pause, so a client that stops reading backs the download copy
+    /// up until it is blocked mid-write.
+    const FAKE_SSH_FLOOD: &str = "@pid@\nexec yes";
+    /// A shim that ignores SIGTERM. The disposition is set to ignore BEFORE the pid is published
+    /// and survives the `exec`, so the recorded process — the only one, no subshell to orphan —
+    /// is genuinely deaf to the polite signal.
+    const FAKE_SSH_IGNORES_SIGTERM: &str = "trap '' TERM\n@pid@\nexec sleep 30";
+    /// A shim that fails the way a real ssh failure does: a non-zero exit nobody asked for.
+    const FAKE_SSH_FAILURE: &str = "@pid@\nexec false";
+
+    impl FakeSsh {
+        fn install(label: &str, body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = std::env::temp_dir().join(format!("herdr-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("ssh");
+            let body = body.replace(
+                PUBLISH_PID,
+                &format!("echo $$ >> '{}'", dir.join("ssh-pids").display()),
+            );
+            std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let old_path = std::env::var_os("PATH").unwrap_or_default();
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", dir.display(), old_path.to_string_lossy()),
+            );
+            Self { dir, old_path }
+        }
+
+        fn spawned_pids(&self) -> Vec<u32> {
+            std::fs::read_to_string(self.dir.join("ssh-pids"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        }
+
+        /// The pid of the ssh the bridge started, once it exists.
+        fn wait_for_spawn(&self, within: Duration) -> Option<u32> {
+            let deadline = Instant::now() + within;
+            loop {
+                if let Some(pid) = self.spawned_pids().first().copied() {
+                    return Some(pid);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    impl Drop for FakeSsh {
+        fn drop(&mut self) {
+            for pid in self.spawned_pids() {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            std::env::set_var("PATH", &self.old_path);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// #72: dropping the bridge ends the ssh children of in-flight connections — a
+    /// teardown/reconnect must not leave an ssh process behind with nobody left to end it. The
+    /// `ssh` binary is shimmed via PATH (nextest runs one process per test, so the env mutation
+    /// is isolated).
     #[test]
     fn bridge_drop_kills_inflight_ssh_children() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("herdr-bridge-kill-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let fake_ssh = dir.join("ssh");
-        std::fs::write(&fake_ssh, "#!/bin/sh\nsleep 30\n").unwrap();
-        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let old_path = std::env::var("PATH").unwrap();
-        std::env::set_var("PATH", format!("{}:{old_path}", dir.display()));
-
-        let socket = dir.join("bridge.sock");
+        let fake_ssh = FakeSsh::install("bridge-kill", FAKE_SSH_SLEEP);
+        let socket = fake_ssh.dir.join("bridge.sock");
         let bridge = SshStdioBridge::start(
             SshTarget::bare("test-host"),
             RemoteHerdr::for_platform(RemotePlatform::local()),
@@ -3238,34 +3426,668 @@ mod tests {
         )
         .unwrap();
 
-        // Keep the local connection open so the worker sits in child.wait() on the fake ssh.
+        // Keep the local connection open so the worker stays in flight on the fake ssh.
         let _conn = UnixStream::connect(&socket).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let pid = loop {
-            let registered = bridge.children.lock().unwrap().iter().next().copied();
-            if let Some(pid) = registered {
-                break pid;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "bridge never spawned its ssh child"
-            );
-            thread::sleep(Duration::from_millis(20));
-        };
+        let pid = fake_ssh
+            .wait_for_spawn(Duration::from_secs(5))
+            .expect("bridge never spawned its ssh child");
 
         drop(bridge);
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        while ssh_process_alive(pid) {
             assert!(
                 Instant::now() < deadline,
                 "in-flight ssh child survived the bridge drop"
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
 
-        std::env::set_var("PATH", old_path);
+    /// Liveness of a pid the fake ssh recorded. `kill(pid, 0)` alone also succeeds for a zombie
+    /// the worker has not reaped yet, which would read as "survived teardown" for a bridge that
+    /// did signal it — so ask the OS for the state and treat `Z` as gone.
+    fn ssh_process_alive(pid: u32) -> bool {
+        let Ok(output) = Command::new("ps")
+            .arg("-o")
+            .arg("state=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+        else {
+            return false;
+        };
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    /// #72: the accept loop spawns each bridge worker DETACHED, so a connection accepted just
+    /// before teardown can first run after `Drop` has already returned. A teardown that acts only
+    /// on connections which registered themselves in time misses exactly this one, and its ssh is
+    /// left running with nobody to end it. The race is made deterministic by gating the worker
+    /// body on a channel released only after `drop(bridge)` returned; the worker is otherwise the
+    /// real one (`spawn_bridge_worker` + `bridge_connection` + the bridge's own stop flag).
+    #[test]
+    fn ssh_child_started_after_bridge_teardown_does_not_outlive_the_bridge() {
+        let fake_ssh = FakeSsh::install("bridge-teardown-race", FAKE_SSH_SLEEP);
+        let bridge = SshStdioBridge::start(
+            SshTarget::bare("test-host"),
+            RemoteHerdr::for_platform(RemotePlatform::local()),
+            fake_ssh.dir.join("bridge.sock"),
+            "test".into(),
+            RemoteBridgeKind::Api,
+        )
+        .unwrap();
+
+        // Exactly what the accept loop captures for a worker: the connection details and the
+        // owning bridge's stop flag.
+        let worker_stop = Arc::clone(&bridge.should_stop);
+        let worker_target = SshTarget::bare("test-host");
+        let worker_remote_herdr = RemoteHerdr::for_platform(RemotePlatform::local());
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        spawn_bridge_worker(stream, move |stream| {
+            // Accepted before teardown, scheduled after it: the thread exists while the bridge is
+            // dropped, but its body has not run yet.
+            release_rx.recv().unwrap();
+            let result = bridge_connection(
+                stream,
+                &worker_target,
+                &worker_remote_herdr,
+                "test",
+                RemoteBridgeKind::Api,
+                &worker_stop,
+            );
+            let _ = finished_tx.send(result.as_ref().map(|_| ()).map_err(|err| err.to_string()));
+            result
+        });
+
+        drop(bridge);
+        release_tx.send(()).unwrap();
+
+        // The worker must actually run and finish — otherwise "no surviving ssh" would also hold
+        // for a worker that was simply never scheduled.
+        let outcome = finished_rx.recv_timeout(Duration::from_secs(3));
+        let finished = outcome.is_ok();
+        let survivors: Vec<u32> = fake_ssh
+            .spawned_pids()
+            .into_iter()
+            .filter(|pid| ssh_process_alive(*pid))
+            .collect();
+
+        assert!(
+            finished,
+            "the worker queued across the teardown never finished, so it is still holding the connection it was given"
+        );
+        assert!(
+            survivors.is_empty(),
+            "ssh child(ren) {survivors:?} started by a worker that ran after the bridge teardown are still alive; a dropped bridge must leave no ssh process behind"
+        );
+        assert_eq!(
+            outcome.unwrap(),
+            Ok(()),
+            "a connection its own bridge stopped is not a connection failure"
+        );
+    }
+
+    /// #72: teardown has to end the WORKER, not just its ssh process. `bridge_connection` returns
+    /// only after `upload.join()`, and that thread is blocked reading the local client stream,
+    /// which an attached client keeps open. So SIGTERMing the child retires the pid while the
+    /// worker thread and the local connection stay stranded for the life of the process — the
+    /// same leak #72 is about, one level up from the pid.
+    #[test]
+    fn bridge_drop_ends_the_worker_while_the_local_connection_stays_open() {
+        use std::io::Read as _;
+
+        let fake_ssh = FakeSsh::install("bridge-worker-exit", FAKE_SSH_SLEEP);
+        let bridge = SshStdioBridge::start(
+            SshTarget::bare("test-host"),
+            RemoteHerdr::for_platform(RemotePlatform::local()),
+            fake_ssh.dir.join("bridge.sock"),
+            "test".into(),
+            RemoteBridgeKind::Api,
+        )
+        .unwrap();
+
+        let worker_stop = Arc::clone(&bridge.should_stop);
+        let worker_target = SshTarget::bare("test-host");
+        let worker_remote_herdr = RemoteHerdr::for_platform(RemotePlatform::local());
+        // `peer` is the local client: it stays connected across the teardown, so the worker's
+        // upload copy has no reason to end on its own.
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        spawn_bridge_worker(stream, move |stream| {
+            let result = bridge_connection(
+                stream,
+                &worker_target,
+                &worker_remote_herdr,
+                "test",
+                RemoteBridgeKind::Api,
+                &worker_stop,
+            );
+            let _ = finished_tx.send(result.as_ref().map(|_| ()).map_err(|err| err.to_string()));
+            result
+        });
+
+        assert!(
+            fake_ssh.wait_for_spawn(Duration::from_secs(5)).is_some(),
+            "worker never reached its ssh child"
+        );
+
+        drop(bridge);
+
+        // The client must be released too: a connection whose bridge is gone has to read as
+        // ended — EOF or a reset. A read that just times out means it is still hanging there.
+        let peer_released = match peer.read(&mut [0_u8; 1]) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(err) => err.kind() == io::ErrorKind::ConnectionReset,
+        };
+        let outcome = finished_rx.recv_timeout(Duration::from_secs(3));
+
+        // Release the client before asserting, so a red run reaps its threads and child here
+        // instead of leaving them for the process to carry.
+        drop(peer);
+        let late = finished_rx.recv_timeout(Duration::from_secs(3));
+
+        assert!(
+            peer_released,
+            "the local client still saw an open connection 3s after its bridge was dropped"
+        );
+        let outcome = outcome.expect(
+            "the bridge worker was still running 3s after its owning bridge was dropped: the ssh child was signalled but the worker stayed blocked forwarding a local connection that is still open",
+        );
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "a connection its own bridge stopped is not a connection failure"
+        );
+        drop(late);
+    }
+
+    /// #72: a client that has stopped reading blocks the download copy mid-write, and a blocked
+    /// write is not released by shutting down the read side — so teardown has to close the socket
+    /// in both directions or the worker stays parked there for the life of the process.
+    #[test]
+    fn bridge_drop_ends_a_worker_whose_client_stopped_reading() {
+        let fake_ssh = FakeSsh::install("bridge-flood", FAKE_SSH_FLOOD);
+        let bridge = SshStdioBridge::start(
+            SshTarget::bare("test-host"),
+            RemoteHerdr::for_platform(RemotePlatform::local()),
+            fake_ssh.dir.join("bridge.sock"),
+            "test".into(),
+            RemoteBridgeKind::Client,
+        )
+        .unwrap();
+
+        let worker_stop = Arc::clone(&bridge.should_stop);
+        let worker_target = SshTarget::bare("test-host");
+        let worker_remote_herdr = RemoteHerdr::for_platform(RemotePlatform::local());
+        // The client connects and then reads nothing at all.
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        spawn_bridge_worker(stream, move |stream| {
+            let result = bridge_connection(
+                stream,
+                &worker_target,
+                &worker_remote_herdr,
+                "test",
+                RemoteBridgeKind::Client,
+                &worker_stop,
+            );
+            let _ = finished_tx.send(result.as_ref().map(|_| ()).map_err(|err| err.to_string()));
+            result
+        });
+
+        assert!(
+            fake_ssh.wait_for_spawn(Duration::from_secs(5)).is_some(),
+            "worker never reached its ssh child"
+        );
+        // Let the unread output fill the pipe and the socket, so the download copy is blocked
+        // inside a write when the bridge goes away.
+        thread::sleep(Duration::from_millis(300));
+
+        drop(bridge);
+
+        let outcome = finished_rx.recv_timeout(Duration::from_secs(3));
+
+        drop(peer);
+        let late = finished_rx.recv_timeout(Duration::from_secs(3));
+
+        let outcome = outcome.expect(
+            "the bridge worker was still running 3s after its owning bridge was dropped: its download copy is blocked writing to a client that stopped reading",
+        );
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "a connection its own bridge stopped is not a connection failure"
+        );
+        drop(late);
+    }
+
+    /// #72: teardown cannot depend on the ssh honouring SIGTERM. A child that ignores it must
+    /// still be gone, and its worker released, a bounded time after the bridge is dropped.
+    #[test]
+    fn bridge_drop_kills_an_ssh_child_that_ignores_sigterm() {
+        let fake_ssh = FakeSsh::install("bridge-deaf-child", FAKE_SSH_IGNORES_SIGTERM);
+        let bridge = SshStdioBridge::start(
+            SshTarget::bare("test-host"),
+            RemoteHerdr::for_platform(RemotePlatform::local()),
+            fake_ssh.dir.join("bridge.sock"),
+            "test".into(),
+            RemoteBridgeKind::Api,
+        )
+        .unwrap();
+
+        let worker_stop = Arc::clone(&bridge.should_stop);
+        let worker_target = SshTarget::bare("test-host");
+        let worker_remote_herdr = RemoteHerdr::for_platform(RemotePlatform::local());
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        spawn_bridge_worker(stream, move |stream| {
+            let result = bridge_connection(
+                stream,
+                &worker_target,
+                &worker_remote_herdr,
+                "test",
+                RemoteBridgeKind::Api,
+                &worker_stop,
+            );
+            let _ = finished_tx.send(result.as_ref().map(|_| ()).map_err(|err| err.to_string()));
+            result
+        });
+
+        let pid = fake_ssh
+            .wait_for_spawn(Duration::from_secs(5))
+            .expect("worker never reached its ssh child");
+
+        drop(bridge);
+
+        let outcome = finished_rx.recv_timeout(BRIDGE_CHILD_KILL_GRACE + Duration::from_secs(5));
+        let survived = ssh_process_alive(pid);
+
+        assert!(
+            outcome.is_ok(),
+            "the worker never came back: its child ignores the polite signal, so nothing else ended it"
+        );
+        assert!(
+            !survived,
+            "an ssh child that ignores SIGTERM survived the bridge drop"
+        );
+    }
+
+    /// The stop-is-not-a-failure rule must not swallow real failures: an ssh that exits non-zero
+    /// on its own is still reported to the caller.
+    #[test]
+    fn bridge_connection_reports_an_ssh_that_fails_on_its_own() {
+        let _fake_ssh = FakeSsh::install("bridge-failure", FAKE_SSH_FAILURE);
+        let bridge_stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&bridge_stop);
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        spawn_bridge_worker(stream, move |stream| {
+            let result = bridge_connection(
+                stream,
+                &SshTarget::bare("test-host"),
+                &RemoteHerdr::for_platform(RemotePlatform::local()),
+                "test",
+                RemoteBridgeKind::Api,
+                &worker_stop,
+            );
+            let _ = finished_tx.send(result.as_ref().map(|_| ()).map_err(|err| err.to_string()));
+            result
+        });
+
+        let outcome = finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker never finished");
+
+        assert!(
+            outcome.is_err(),
+            "an ssh that exited non-zero by itself was reported as a successful connection"
+        );
+    }
+
+    /// #72, the reconnect case: when the ssh dies on its own the worker has to end with it, even
+    /// though the local client is still attached and has sent nothing. Nothing signals the bridge
+    /// here — no drop, no stop flag — so the only thing that can release the copy parked on the
+    /// client is the worker itself, once its child is gone.
+    #[test]
+    fn worker_ends_when_its_ssh_exits_while_the_client_stays_connected() {
+        let _fake_ssh = FakeSsh::install("bridge-ssh-exit", FAKE_SSH_IMMEDIATE_EXIT);
+        let bridge_stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&bridge_stop);
+        // The client never writes and never disconnects, exactly like an idle attached TUI.
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        spawn_bridge_worker(stream, move |stream| {
+            let result = bridge_connection(
+                stream,
+                &SshTarget::bare("test-host"),
+                &RemoteHerdr::for_platform(RemotePlatform::local()),
+                "test",
+                RemoteBridgeKind::Api,
+                &worker_stop,
+            );
+            let _ = finished_tx.send(result.as_ref().map(|_| ()).map_err(|err| err.to_string()));
+            result
+        });
+
+        let outcome = finished_rx.recv_timeout(Duration::from_secs(5)).expect(
+            "the worker outlived its ssh child: it stayed blocked on a client that never sends anything, so every reconnect would leak a thread and a connection",
+        );
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "an ssh that exited cleanly is not a failure"
+        );
+    }
+
+    /// #72 guard on the fix itself: the teardown path shuts the local socket down, so the normal
+    /// path must not. A bridge request is a half-close exchange — the client writes, shuts down
+    /// its write side, and only then does the remote answer — and the worker has to hand back
+    /// every byte of that answer, plus the EOF that ends it, before it finishes.
+    #[test]
+    fn bridge_connection_drains_the_response_after_the_client_half_closes() {
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let _fake_ssh = FakeSsh::install("bridge-roundtrip", FAKE_SSH_REQUEST_RESPONSE);
+        let bridge_stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&bridge_stop);
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        spawn_bridge_worker(stream, move |stream| {
+            let result = bridge_connection(
+                stream,
+                &SshTarget::bare("test-host"),
+                &RemoteHerdr::for_platform(RemotePlatform::local()),
+                "test",
+                RemoteBridgeKind::Api,
+                &worker_stop,
+            );
+            let _ = finished_tx.send(result.as_ref().map(|_| ()).map_err(|err| err.to_string()));
+            result
+        });
+
+        peer.write_all(b"ping").unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        // Leave the response unread for a moment: the shim is then done and its child reaped
+        // while the tail of the reply is still sitting in the pipe and the socket, which is
+        // exactly the state a teardown-style shutdown at that point would truncate.
+        thread::sleep(Duration::from_millis(300));
+        let mut response = Vec::new();
+        let read = peer.read_to_end(&mut response);
+        let outcome = finished_rx.recv_timeout(Duration::from_secs(5));
+
+        read.expect("client never reached the end of the response");
+        assert_eq!(
+            response.len(),
+            "pong:ping".len() + FAKE_SSH_RESPONSE_PADDING,
+            "the response the client drained was truncated"
+        );
+        assert!(response.starts_with(b"pong:ping"));
+        assert!(
+            response[9..].iter().all(|byte| *byte == b'0'),
+            "the response the client drained was corrupted"
+        );
+        assert_eq!(
+            outcome.expect("the worker outlived the exchange it was serving"),
+            Ok(()),
+            "a completed exchange is not a failure"
+        );
+    }
+
+    /// #72 live characterization against a REAL ssh/sshd, ignored by default. Every bridge test
+    /// above shims `ssh` with a shell script, so none of them exercises OpenSSH multiplexing — the
+    /// mechanism #72 added to stop stacking one connection per poll. Run it with:
+    ///
+    /// ```text
+    /// HERDR_NATIVE_SSH_HOST=localhost cargo nextest run --run-ignored=all -E 'test(native_ssh)'
+    /// ```
+    ///
+    /// Breaks it catches, none of which the fake ssh can see:
+    ///
+    ///  * a teardown that fails to end its per-connection ssh when the peer is a real sshd holding
+    ///    the channel open (the client here never half-closes, so ONLY the stop path in
+    ///    `finish_bridge_connection` can retire that child);
+    ///  * the mux pin-detection in `SshTarget::command` regressing so herdr injects its own trio
+    ///    over the caller's — ssh is first-value-wins, the master would move to herdr's own
+    ///    `ControlPath`, and each cycle would open a fresh connection to the host instead of one;
+    ///  * `ControlPersist` not reaching the wire, leaving a master that never retires.
+    ///
+    /// Scope, deliberately narrow: this is the CLIENT-side channel/master lifecycle only. It proves
+    /// nothing about `ServerAliveInterval`/`ServerAliveCountMax` — no link is blackholed here, so
+    /// no claim about how fast a hung session dies on either end follows from it.
+    ///
+    /// The mux options are passed explicitly because `SshTarget::command` skips its WHOLE trio once
+    /// the caller pins any mux knob: an isolated per-test `ControlPath` has to bring
+    /// `ControlMaster`/`ControlPersist` with it. That isolation is the point — the test never
+    /// touches the shared `herdr-cm-*` master a real herdr may be holding.
+    #[test]
+    #[ignore = "needs a reachable ssh host: HERDR_NATIVE_SSH_HOST=localhost"]
+    fn native_ssh_bridge_cycles_share_one_control_master_that_retires() {
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let host = std::env::var("HERDR_NATIVE_SSH_HOST")
+            .expect("set HERDR_NATIVE_SSH_HOST to the ssh destination this test may connect to");
+        // Scratch for the socket + control path: `HERDR_NATIVE_SSH_DIR` puts it inside a caller's
+        // session scratch, otherwise the per-user temp dir every other test here uses. Either way
+        // it must stay SHORT — ssh appends a 17-byte suffix while binding the master listener and
+        // sun_path is 104 bytes, so a deep scratch prefix silently disables multiplexing.
+        let base = std::env::var_os("HERDR_NATIVE_SSH_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("herdr-native-ssh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("bridge.sock");
+        let control_path = dir.join("cm");
+        let options = native_mux_options(&control_path);
+        // `sh -c 'exec cat' --` turns the bridge subcommand into a harmless `$0`, so the remote
+        // side is a plain echo: no herdr binary, no file written, nothing installed over there.
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform::local())
+            .with_shell_path("sh -c 'exec cat' --".into());
+        let _guard = NativeMasterGuard {
+            host: host.clone(),
+            dir: dir.clone(),
+            control_path: control_path.clone(),
+        };
+
+        let mut masters = Vec::new();
+        for cycle in 0..3 {
+            let bridge = SshStdioBridge::start(
+                SshTarget::new(host.clone(), options.clone()),
+                remote_herdr.clone(),
+                socket.clone(),
+                "test".into(),
+                RemoteBridgeKind::Api,
+            )
+            .unwrap();
+            let mut conn = UnixStream::connect(&socket).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let sent = format!("herdr72-cycle-{cycle}");
+            conn.write_all(sent.as_bytes()).unwrap();
+            let mut echoed = vec![0u8; sent.len()];
+            conn.read_exact(&mut echoed)
+                .expect("the remote answer never came back through the bridge");
+            assert_eq!(
+                String::from_utf8_lossy(&echoed),
+                sent,
+                "cycle {cycle} did not round-trip through the real ssh"
+            );
+            let master = native_master_pid(&host, &control_path).unwrap_or_else(|| {
+                panic!("cycle {cycle} ran without a live control master on the test's own path")
+            });
+            masters.push(master);
+
+            // The client stays open across the teardown, so the remote `cat` is still waiting for
+            // input: nothing but the bridge's own stop path can end this ssh.
+            drop(bridge);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let channels = native_mux_channels(&control_path, master);
+                if channels.is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cycle {cycle}: ssh channel process(es) {channels:?} outlived the bridge teardown"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+            // The teardown also has to let the CLIENT go: it shuts the local socket down, so this
+            // still-open connection must reach EOF (or a reset) instead of hanging forever. This
+            // covers the socket side of the stop path only — the worker thread is detached here,
+            // so its actual return stays observable only in the unit tests above, which own it.
+            let mut tail = [0u8; 1];
+            match conn.read(&mut tail) {
+                Ok(0) => {}
+                Ok(_) => panic!("cycle {cycle}: the bridge kept sending after its teardown"),
+                Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+                Err(err) => {
+                    panic!("cycle {cycle}: the local connection never ended after teardown: {err}")
+                }
+            }
+            drop(conn);
+        }
+
+        assert!(
+            masters.iter().all(|pid| *pid == masters[0]),
+            "each bridge cycle opened a NEW connection to the host instead of reusing the live master: {masters:?}"
+        );
+        // ControlPersist=60 retires the master ~60s after its last channel closed. Bounded so a
+        // master that never retires fails the test instead of hanging the run.
+        //
+        // The wait polls the pid PASSIVELY: `ssh -O check` connects to the master, and that
+        // connection restarts its persist countdown, so a check-based poll keeps alive exactly the
+        // thing it is asking about. Measured against this sshd with `ControlPersist=5`: passive
+        // polling saw the master retire at 5s, while a 1s `-O check` loop still had it alive at
+        // 30s.
+        let deadline = Instant::now() + Duration::from_secs(75);
+        while native_process_alive(masters[0]) {
+            assert!(
+                Instant::now() < deadline,
+                "control master {} never retired after the last channel closed",
+                masters[0]
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// The native test's own mux options. `-F /dev/null` keeps the run hermetic (the developer's
+    /// `~/.ssh/config` cannot redirect it) and `BatchMode` makes a missing key a failure rather
+    /// than a prompt that hangs the suite.
+    fn native_mux_options(control_path: &Path) -> Vec<String> {
+        vec![
+            "-F".into(),
+            "/dev/null".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=5".into(),
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!("ControlPath={}", control_path.display()),
+            "-o".into(),
+            "ControlPersist=60".into(),
+        ]
+    }
+
+    /// The live master pid for THIS control path, read from `ssh -O check` ("Master running
+    /// (pid=N)"). `None` once no master answers on the path.
+    fn native_master_pid(host: &str, control_path: &Path) -> Option<u32> {
+        let output = Command::new("ssh")
+            .args(["-F", "/dev/null", "-o"])
+            .arg(format!("ControlPath={}", control_path.display()))
+            .args(["-O", "check", host])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&output.stderr)
+            .split("pid=")
+            .nth(1)?
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+
+    /// Live ssh processes holding THIS control path, minus the persistent master — i.e. the
+    /// per-connection channels a finished bridge worker must have reaped.
+    ///
+    /// Fails closed: an inspection that could not be made is not evidence that the channels are
+    /// gone, so a broken `pgrep` fails the test instead of reporting an empty list.
+    fn native_mux_channels(control_path: &Path, master: u32) -> Vec<u32> {
+        let output = Command::new("pgrep")
+            .arg("-f")
+            .arg(control_path.to_string_lossy().as_ref())
+            .output()
+            .expect("pgrep must run: a failed inspection is not proof that the channels are gone");
+        match output.status.code() {
+            // pgrep: 0 = matches, 1 = no matches. Anything else is a broken observation.
+            Some(0) => {}
+            Some(1) => return Vec::new(),
+            other => panic!(
+                "pgrep could not inspect the channels on {}: exit {other:?}",
+                control_path.display()
+            ),
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| *pid != master && native_process_alive(*pid))
+            .collect()
+    }
+
+    /// Liveness for the native test. Same zombie rule as [`ssh_process_alive`], but a `ps` that
+    /// could not be run or answered unexpectedly fails the test rather than reading as "gone" —
+    /// this one backs a receipt about processes the bridge was supposed to end.
+    fn native_process_alive(pid: u32) -> bool {
+        let output = Command::new("ps")
+            .args(["-o", "state=", "-p"])
+            .arg(pid.to_string())
+            .output()
+            .expect("ps must run: a failed inspection is not proof that the process is gone");
+        match output.status.code() {
+            Some(0) => {
+                let state = String::from_utf8_lossy(&output.stdout);
+                let state = state.trim();
+                !state.is_empty() && !state.starts_with('Z')
+            }
+            // `ps` reports no such process by exiting 1 with empty output.
+            Some(1) => false,
+            other => panic!("ps could not inspect pid {pid}: exit {other:?}"),
+        }
+    }
+
+    /// Test-only cleanup, scoped to what this test created: the master on its own control path and
+    /// its own temp dir. Never a blanket `pkill ssh` — that would take the developer's interactive
+    /// sessions and herdr's shared `herdr-cm-*` master with it.
+    struct NativeMasterGuard {
+        host: String,
+        dir: PathBuf,
+        control_path: PathBuf,
+    }
+
+    impl Drop for NativeMasterGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("ssh")
+                .args(["-F", "/dev/null", "-o"])
+                .arg(format!("ControlPath={}", self.control_path.display()))
+                .args(["-O", "exit", &self.host])
+                .output();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     #[test]
