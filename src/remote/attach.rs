@@ -316,8 +316,14 @@ impl SshTarget {
         // #72: keepalive. Without it a hung TCP (sleep/wake, network switch, dropped VPN) left the
         // bridge ssh — and its sshd session on the remote — alive for hours while reconnects
         // stacked fresh connections on top, until the remote's sshd stopped accepting new ones.
-        // Dead links now self-terminate within ~60s on both ends. Skip when the user pinned either
-        // knob in their own options.
+        // 15s x 4 bounds the CLIENT end only: this ssh disconnects roughly 60s after the last
+        // reply it received (ssh_config.5, ServerAliveCountMax — "ssh will disconnect from the
+        // server"). It says nothing about the far end. sshd reaps its side of a blackholed link on
+        // its own policy — ClientAliveInterval/ClientAliveCountMax are independent sshd options,
+        // and ClientAliveInterval defaults to 0 (disabled), leaving TCPKeepAlive's hour-scale
+        // timeout — none of which herdr sets or may assume. What the client bound does fix is the
+        // stacking: letting go within a minute stops herdr piling new sessions onto dead ones.
+        // Skip when the user pinned either knob in their own options.
         if !options_pin_keyword(&self.options, "serveraliveinterval") {
             command.arg("-o").arg("ServerAliveInterval=15");
         }
@@ -2290,9 +2296,10 @@ fn finish_bridge_connection(
         }
         match signalled_at {
             None if bridge_stop.load(Ordering::Acquire) => {
-                unsafe {
-                    libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
-                }
+                crate::platform::signal_processes(
+                    &[child.id()],
+                    crate::platform::Signal::Terminate,
+                );
                 let _ = local_stream.shutdown(std::net::Shutdown::Both);
                 signalled_at = Some(Instant::now());
             }
@@ -3833,6 +3840,254 @@ mod tests {
             Ok(()),
             "a completed exchange is not a failure"
         );
+    }
+
+    /// #72 live characterization against a REAL ssh/sshd, ignored by default. Every bridge test
+    /// above shims `ssh` with a shell script, so none of them exercises OpenSSH multiplexing — the
+    /// mechanism #72 added to stop stacking one connection per poll. Run it with:
+    ///
+    /// ```text
+    /// HERDR_NATIVE_SSH_HOST=localhost cargo nextest run --run-ignored=all -E 'test(native_ssh)'
+    /// ```
+    ///
+    /// Breaks it catches, none of which the fake ssh can see:
+    ///
+    ///  * a teardown that fails to end its per-connection ssh when the peer is a real sshd holding
+    ///    the channel open (the client here never half-closes, so ONLY the stop path in
+    ///    `finish_bridge_connection` can retire that child);
+    ///  * the mux pin-detection in `SshTarget::command` regressing so herdr injects its own trio
+    ///    over the caller's — ssh is first-value-wins, the master would move to herdr's own
+    ///    `ControlPath`, and each cycle would open a fresh connection to the host instead of one;
+    ///  * `ControlPersist` not reaching the wire, leaving a master that never retires.
+    ///
+    /// Scope, deliberately narrow: this is the CLIENT-side channel/master lifecycle only. It proves
+    /// nothing about `ServerAliveInterval`/`ServerAliveCountMax` — no link is blackholed here, so
+    /// no claim about how fast a hung session dies on either end follows from it.
+    ///
+    /// The mux options are passed explicitly because `SshTarget::command` skips its WHOLE trio once
+    /// the caller pins any mux knob: an isolated per-test `ControlPath` has to bring
+    /// `ControlMaster`/`ControlPersist` with it. That isolation is the point — the test never
+    /// touches the shared `herdr-cm-*` master a real herdr may be holding.
+    #[test]
+    #[ignore = "needs a reachable ssh host: HERDR_NATIVE_SSH_HOST=localhost"]
+    fn native_ssh_bridge_cycles_share_one_control_master_that_retires() {
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let host = std::env::var("HERDR_NATIVE_SSH_HOST")
+            .expect("set HERDR_NATIVE_SSH_HOST to the ssh destination this test may connect to");
+        // Scratch for the socket + control path: `HERDR_NATIVE_SSH_DIR` puts it inside a caller's
+        // session scratch, otherwise the per-user temp dir every other test here uses. Either way
+        // it must stay SHORT — ssh appends a 17-byte suffix while binding the master listener and
+        // sun_path is 104 bytes, so a deep scratch prefix silently disables multiplexing.
+        let base = std::env::var_os("HERDR_NATIVE_SSH_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("herdr-native-ssh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("bridge.sock");
+        let control_path = dir.join("cm");
+        let options = native_mux_options(&control_path);
+        // `sh -c 'exec cat' --` turns the bridge subcommand into a harmless `$0`, so the remote
+        // side is a plain echo: no herdr binary, no file written, nothing installed over there.
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform::local())
+            .with_shell_path("sh -c 'exec cat' --".into());
+        let _guard = NativeMasterGuard {
+            host: host.clone(),
+            dir: dir.clone(),
+            control_path: control_path.clone(),
+        };
+
+        let mut masters = Vec::new();
+        for cycle in 0..3 {
+            let bridge = SshStdioBridge::start(
+                SshTarget::new(host.clone(), options.clone()),
+                remote_herdr.clone(),
+                socket.clone(),
+                "test".into(),
+                RemoteBridgeKind::Api,
+            )
+            .unwrap();
+            let mut conn = UnixStream::connect(&socket).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let sent = format!("herdr72-cycle-{cycle}");
+            conn.write_all(sent.as_bytes()).unwrap();
+            let mut echoed = vec![0u8; sent.len()];
+            conn.read_exact(&mut echoed)
+                .expect("the remote answer never came back through the bridge");
+            assert_eq!(
+                String::from_utf8_lossy(&echoed),
+                sent,
+                "cycle {cycle} did not round-trip through the real ssh"
+            );
+            let master = native_master_pid(&host, &control_path).unwrap_or_else(|| {
+                panic!("cycle {cycle} ran without a live control master on the test's own path")
+            });
+            masters.push(master);
+
+            // The client stays open across the teardown, so the remote `cat` is still waiting for
+            // input: nothing but the bridge's own stop path can end this ssh.
+            drop(bridge);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let channels = native_mux_channels(&control_path, master);
+                if channels.is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cycle {cycle}: ssh channel process(es) {channels:?} outlived the bridge teardown"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+            // The teardown also has to let the CLIENT go: it shuts the local socket down, so this
+            // still-open connection must reach EOF (or a reset) instead of hanging forever. This
+            // covers the socket side of the stop path only — the worker thread is detached here,
+            // so its actual return stays observable only in the unit tests above, which own it.
+            let mut tail = [0u8; 1];
+            match conn.read(&mut tail) {
+                Ok(0) => {}
+                Ok(_) => panic!("cycle {cycle}: the bridge kept sending after its teardown"),
+                Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+                Err(err) => {
+                    panic!("cycle {cycle}: the local connection never ended after teardown: {err}")
+                }
+            }
+            drop(conn);
+        }
+
+        assert!(
+            masters.iter().all(|pid| *pid == masters[0]),
+            "each bridge cycle opened a NEW connection to the host instead of reusing the live master: {masters:?}"
+        );
+        // ControlPersist=60 retires the master ~60s after its last channel closed. Bounded so a
+        // master that never retires fails the test instead of hanging the run.
+        //
+        // The wait polls the pid PASSIVELY: `ssh -O check` connects to the master, and that
+        // connection restarts its persist countdown, so a check-based poll keeps alive exactly the
+        // thing it is asking about. Measured against this sshd with `ControlPersist=5`: passive
+        // polling saw the master retire at 5s, while a 1s `-O check` loop still had it alive at
+        // 30s.
+        let deadline = Instant::now() + Duration::from_secs(75);
+        while native_process_alive(masters[0]) {
+            assert!(
+                Instant::now() < deadline,
+                "control master {} never retired after the last channel closed",
+                masters[0]
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// The native test's own mux options. `-F /dev/null` keeps the run hermetic (the developer's
+    /// `~/.ssh/config` cannot redirect it) and `BatchMode` makes a missing key a failure rather
+    /// than a prompt that hangs the suite.
+    fn native_mux_options(control_path: &Path) -> Vec<String> {
+        vec![
+            "-F".into(),
+            "/dev/null".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=5".into(),
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!("ControlPath={}", control_path.display()),
+            "-o".into(),
+            "ControlPersist=60".into(),
+        ]
+    }
+
+    /// The live master pid for THIS control path, read from `ssh -O check` ("Master running
+    /// (pid=N)"). `None` once no master answers on the path.
+    fn native_master_pid(host: &str, control_path: &Path) -> Option<u32> {
+        let output = Command::new("ssh")
+            .args(["-F", "/dev/null", "-o"])
+            .arg(format!("ControlPath={}", control_path.display()))
+            .args(["-O", "check", host])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&output.stderr)
+            .split("pid=")
+            .nth(1)?
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+
+    /// Live ssh processes holding THIS control path, minus the persistent master — i.e. the
+    /// per-connection channels a finished bridge worker must have reaped.
+    ///
+    /// Fails closed: an inspection that could not be made is not evidence that the channels are
+    /// gone, so a broken `pgrep` fails the test instead of reporting an empty list.
+    fn native_mux_channels(control_path: &Path, master: u32) -> Vec<u32> {
+        let output = Command::new("pgrep")
+            .arg("-f")
+            .arg(control_path.to_string_lossy().as_ref())
+            .output()
+            .expect("pgrep must run: a failed inspection is not proof that the channels are gone");
+        match output.status.code() {
+            // pgrep: 0 = matches, 1 = no matches. Anything else is a broken observation.
+            Some(0) => {}
+            Some(1) => return Vec::new(),
+            other => panic!(
+                "pgrep could not inspect the channels on {}: exit {other:?}",
+                control_path.display()
+            ),
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| *pid != master && native_process_alive(*pid))
+            .collect()
+    }
+
+    /// Liveness for the native test. Same zombie rule as [`ssh_process_alive`], but a `ps` that
+    /// could not be run or answered unexpectedly fails the test rather than reading as "gone" —
+    /// this one backs a receipt about processes the bridge was supposed to end.
+    fn native_process_alive(pid: u32) -> bool {
+        let output = Command::new("ps")
+            .args(["-o", "state=", "-p"])
+            .arg(pid.to_string())
+            .output()
+            .expect("ps must run: a failed inspection is not proof that the process is gone");
+        match output.status.code() {
+            Some(0) => {
+                let state = String::from_utf8_lossy(&output.stdout);
+                let state = state.trim();
+                !state.is_empty() && !state.starts_with('Z')
+            }
+            // `ps` reports no such process by exiting 1 with empty output.
+            Some(1) => false,
+            other => panic!("ps could not inspect pid {pid}: exit {other:?}"),
+        }
+    }
+
+    /// Test-only cleanup, scoped to what this test created: the master on its own control path and
+    /// its own temp dir. Never a blanket `pkill ssh` — that would take the developer's interactive
+    /// sessions and herdr's shared `herdr-cm-*` master with it.
+    struct NativeMasterGuard {
+        host: String,
+        dir: PathBuf,
+        control_path: PathBuf,
+    }
+
+    impl Drop for NativeMasterGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("ssh")
+                .args(["-F", "/dev/null", "-o"])
+                .arg(format!("ControlPath={}", self.control_path.display()))
+                .args(["-O", "exit", &self.host])
+                .output();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     #[test]
